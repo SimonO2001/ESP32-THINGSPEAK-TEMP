@@ -1,117 +1,209 @@
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
-
-// Existing libraries
 #include <WiFi.h>
+#include <WiFiManager.h> // Include WiFiManager
 #include <OneWire.h>
 #include <DallasTemperature.h>
-#include "time.h"
+#include <DHT.h>
+#include <SPIFFS.h>
+#include <esp_sleep.h>
 
 // OLED display settings
-#define SCREEN_WIDTH 128 // OLED width in pixels
-#define SCREEN_HEIGHT 32 // OLED height in pixels
-#define OLED_RESET    -1 // Reset pin (or -1 if sharing Arduino reset pin)
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 32
+#define OLED_RESET -1
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
-
-// Wi-Fi credentials
-const char* ssid = "Oksen";
-const char* password = "!55Oksen6792";
 
 // ThingSpeak settings
 const char* server = "api.thingspeak.com";
-String apiKey = "ZSBLLEJR2OISZZ0V"; // Replace with your actual API Key
+String apiKey = "ZSBLLEJR2OISZZ0V";
 
-// NTP Server
-const char* ntpServer = "pool.ntp.org";
-const long  gmtOffset_sec = 3600;        // Adjust for your timezone
-const int   daylightOffset_sec = 3600;   // Adjust if daylight saving time
-
-// Temperature Sensor
+// Temperature and Humidity Sensors
 #define ONE_WIRE_BUS 5
+#define DHTPIN 33
+#define DHTTYPE DHT11
+
 OneWire oneWire(ONE_WIRE_BUS);
 DallasTemperature sensors(&oneWire);
+DHT dht(DHTPIN, DHTTYPE);
 
-// LED Pin
-#define LED_PIN 4 // GPIO4 connected to the LED
+// LED and Button Pins
+#define LED_READINGS 23
+#define LED_PIN 4
+#define BUTTON_PIN 12  // GPIO12 for deep sleep button
+
+// Debounce variables
+unsigned long lastPressTime = 0;
+const unsigned long debounceDelay = 200; // 200 milliseconds
+
+// ThingSpeak timing
+unsigned long lastThingSpeakTime = 0;
+const unsigned long thingSpeakInterval = 20000;
+
+// Data collection timing
+unsigned long lastDataCollectionTime = 0;
+const unsigned long dataCollectionInterval = 1000; // 1 second
+int bufferIndex = 0;
+bool collectingData = false;
+
+// Data buffer
+float tempBuffer[10] = {0};
+float humBuffer[10] = {0};
+
+// Function prototypes
+void handleDeepSleepButton();
+void handleDataCollection();
+void handleThingSpeak();
+void printFileContents();
 
 void setup() {
   Serial.begin(115200);
 
-  // Initialize LED pin
+  // Configure LED and button pins
+  pinMode(LED_READINGS, OUTPUT);
   pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, LOW); // Ensure LED is off initially
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  digitalWrite(LED_READINGS, LOW);
+  digitalWrite(LED_PIN, LOW);
 
-  // Initialize the OLED display
-  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) { // 0x3C is the I2C address for the display
-    Serial.println(F("SSD1306 allocation failed"));
-    for(;;); // Loop forever if initialization fails
+  // Check if waking up from deep sleep
+  if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0) {
+    Serial.println("Woke up from deep sleep!");
+    delay(1000); // Allow time for button to be released
+  } else {
+    Serial.println("Normal boot");
+  }
+
+  // Initialize SPIFFS
+  if (!SPIFFS.begin(true)) {
+    Serial.println("Failed to mount SPIFFS");
+    while (1);
+  }
+
+  // Initialize OLED
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("SSD1306 allocation failed");
+    while (1);
   }
   display.clearDisplay();
-  display.setTextSize(1);      // Normal 1:1 pixel scale
-  display.setTextColor(SSD1306_WHITE); // Draw white text
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
   display.setCursor(0, 0);
   display.println("Initializing...");
   display.display();
 
-  // Connect to Wi-Fi
-  Serial.print("Connecting to Wi-Fi...");
-  display.println("Connecting to Wi-Fi...");
-  display.display();
+  // Use WiFiManager to manage Wi-Fi connection
+  WiFiManager wifiManager;
 
-  WiFi.begin(ssid, password);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-    display.print(".");
-    display.display();
+  // Uncomment to reset saved Wi-Fi credentials (for testing)
+  // wifiManager.resetSettings();
+
+  if (!wifiManager.autoConnect("ESP32_WiFiManager")) {
+    Serial.println("Failed to connect to Wi-Fi.");
+    while (1);
   }
-  Serial.println(" Connected.");
-  display.println("Connected.");
+
+  Serial.println("Connected to Wi-Fi.");
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.println("Wi-Fi Connected:");
+  display.println(WiFi.SSID());
   display.display();
 
-  // Initialize NTP
-  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
-
-  // Initialize temperature sensor
+  // Initialize sensors
   sensors.begin();
+  dht.begin();
 
-  delay(1000); // Wait for a moment
-  display.clearDisplay();
+  // Configure the button as a wake-up source
+  esp_sleep_enable_ext0_wakeup((gpio_num_t)BUTTON_PIN, 0); // Wake up when button is pressed
 }
 
 void loop() {
-  // Request temperature
-  sensors.requestTemperatures();
-  float tempC = sensors.getTempCByIndex(0);
+  handleDeepSleepButton();
+  handleDataCollection();
+  handleThingSpeak();
+}
 
-  // Get current time
-  struct tm timeinfo;
-  if (!getLocalTime(&timeinfo)) {
-    Serial.println("Failed to obtain time");
+void handleDeepSleepButton() {
+  if (digitalRead(BUTTON_PIN) == LOW) {
+    unsigned long currentTime = millis();
+    if (currentTime - lastPressTime > debounceDelay) {
+      lastPressTime = currentTime;
+
+      Serial.println("Button pressed, entering deep sleep...");
+      delay(500); // Stabilize
+      esp_deep_sleep_start();
+    }
   }
+}
 
-  // Format time
-  char timeString[64];
-  strftime(timeString, sizeof(timeString), "%Y-%m-%d %H:%M:%S", &timeinfo);
+void handleDataCollection() {
+  if (millis() - lastDataCollectionTime >= dataCollectionInterval) {
+    lastDataCollectionTime = millis();
 
-  if (tempC != DEVICE_DISCONNECTED_C)
-  {
-    // Display temperature and time on OLED
-    display.clearDisplay();
-    display.setCursor(0, 0);
-    display.print("Temp: ");
-    display.print(tempC);
-    display.println(" C");
-    display.println(timeString);
-    display.display();
+    if (bufferIndex < 10) {
+      sensors.requestTemperatures();
+      tempBuffer[bufferIndex] = sensors.getTempCByIndex(0);
+      humBuffer[bufferIndex] = dht.readHumidity();
 
-    // Send data to ThingSpeak
+      digitalWrite(LED_READINGS, HIGH);
+      delay(100);
+      digitalWrite(LED_READINGS, LOW);
+
+      display.clearDisplay();
+      display.setCursor(0, 0);
+      display.print("Temp: ");
+      display.print(tempBuffer[bufferIndex]);
+      display.println(" C");
+      display.print("Hum: ");
+      display.print(humBuffer[bufferIndex]);
+      display.println(" %");
+      display.display();
+
+      bufferIndex++;
+    } else if (!collectingData) {
+      collectingData = true;
+
+      float avgTemp = 0, avgHum = 0;
+      for (int i = 0; i < 10; i++) {
+        avgTemp += tempBuffer[i];
+        avgHum += humBuffer[i];
+      }
+      avgTemp /= 10;
+      avgHum /= 10;
+
+      File file = SPIFFS.open("/data.txt", FILE_APPEND);
+      if (file) {
+        file.printf("Avg Temp: %.2f C, Avg Hum: %.2f %%\n", avgTemp, avgHum);
+        file.close();
+        Serial.println("Data saved to SPIFFS");
+      } else {
+        Serial.println("Failed to open file for writing");
+      }
+
+      bufferIndex = 0;
+      collectingData = false;
+    }
+  }
+}
+
+void handleThingSpeak() {
+  if (millis() - lastThingSpeakTime >= thingSpeakInterval) {
+    lastThingSpeakTime = millis();
+
+    float avgTemp = 0, avgHum = 0;
+    for (int i = 0; i < 10; i++) {
+      avgTemp += tempBuffer[i];
+      avgHum += humBuffer[i];
+    }
+    avgTemp /= 10;
+    avgHum /= 10;
+
     if (WiFi.status() == WL_CONNECTED) {
       WiFiClient client;
-
       if (client.connect(server, 80)) {
-        String postStr = "api_key=" + apiKey + "&field1=" + String(tempC);
+        String postStr = "api_key=" + apiKey + "&field1=" + String(avgTemp) + "&field2=" + String(avgHum);
 
         client.println("POST /update HTTP/1.1");
         client.println("Host: api.thingspeak.com");
@@ -125,40 +217,28 @@ void loop() {
         Serial.println("Data sent to ThingSpeak:");
         Serial.println(postStr);
 
-        // Read and print the response from ThingSpeak
-        while (client.connected() || client.available()) {
-          if (client.available()) {
-            String line = client.readStringUntil('\n');
-            Serial.println(line);
-          }
-        }
         client.stop();
-
-        // Flash the LED for 500 milliseconds
-        digitalWrite(LED_PIN, HIGH); // Turn LED on
-        delay(500);                  // Wait for 500 milliseconds
-        digitalWrite(LED_PIN, LOW);  // Turn LED off
-
+        digitalWrite(LED_PIN, HIGH);
+        delay(500);
+        digitalWrite(LED_PIN, LOW);
       } else {
-        Serial.println("Connection to ThingSpeak failed.");
-        display.println("Failed to send data.");
-        display.display();
+        Serial.println("Failed to connect to ThingSpeak");
       }
     } else {
-      Serial.println("WiFi Disconnected");
-      display.println("WiFi Disconnected");
-      display.display();
+      Serial.println("WiFi disconnected");
     }
-
-    // Delay before next reading
-    delay(20000); // Wait 20 seconds before sending the next data
   }
-  else
-  {
-    Serial.println("Error: Could not read temperature data");
-    display.clearDisplay();
-    display.println("Temp Sensor Error");
-    display.display();
-    delay(5000);
+}
+
+void printFileContents() {
+  if (SPIFFS.exists("/data.txt")) {
+    File file = SPIFFS.open("/data.txt", FILE_READ);
+    Serial.println("Reading data.txt:");
+    while (file.available()) {
+      Serial.write(file.read());
+    }
+    file.close();
+  } else {
+    Serial.println("data.txt does not exist.");
   }
 }
