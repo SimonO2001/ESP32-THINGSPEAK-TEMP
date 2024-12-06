@@ -31,10 +31,12 @@ DHT dht(DHTPIN, DHTTYPE);
 // LED and Button Pins
 #define LED_READINGS 23
 #define LED_PIN 4
-#define BUTTON_PIN 12  // GPIO12 for deep sleep button
+#define BUTTON_SLEEP 12  // GPIO12 for deep sleep button
+#define BUTTON_PRINT 14  // GPIO14 for printing last 10 entries
 
 // Debounce variables
-unsigned long lastPressTime = 0;
+unsigned long lastPressTimeSleep = 0;
+unsigned long lastPressTimePrint = 0;
 const unsigned long debounceDelay = 200; // 200 milliseconds
 
 // ThingSpeak timing
@@ -53,9 +55,11 @@ float humBuffer[10] = {0};
 
 // Function prototypes
 void handleDeepSleepButton();
+void handlePrintButton();
 void handleDataCollection();
 void handleThingSpeak();
-void printFileContents();
+void printLastEntries();
+void updateOLED(float temp, float hum, const String &timestamp);
 
 void setup() {
   Serial.begin(115200);
@@ -63,7 +67,8 @@ void setup() {
   // Configure LED and button pins
   pinMode(LED_READINGS, OUTPUT);
   pinMode(LED_PIN, OUTPUT);
-  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  pinMode(BUTTON_SLEEP, INPUT_PULLUP);
+  pinMode(BUTTON_PRINT, INPUT_PULLUP);
   digitalWrite(LED_READINGS, LOW);
   digitalWrite(LED_PIN, LOW);
 
@@ -115,25 +120,43 @@ void setup() {
   sensors.begin();
   dht.begin();
 
-  // Configure the button as a wake-up source
-  esp_sleep_enable_ext0_wakeup((gpio_num_t)BUTTON_PIN, 0); // Wake up when button is pressed
+  // Configure the sleep button as a wake-up source
+  esp_sleep_enable_ext0_wakeup((gpio_num_t)BUTTON_SLEEP, 0); // Wake up when button is pressed
 }
 
 void loop() {
   handleDeepSleepButton();
+  handlePrintButton();
   handleDataCollection();
   handleThingSpeak();
 }
 
 void handleDeepSleepButton() {
-  if (digitalRead(BUTTON_PIN) == LOW) {
+  if (digitalRead(BUTTON_SLEEP) == LOW) {
     unsigned long currentTime = millis();
-    if (currentTime - lastPressTime > debounceDelay) {
-      lastPressTime = currentTime;
+    if (currentTime - lastPressTimeSleep > debounceDelay) {
+      lastPressTimeSleep = currentTime;
 
       Serial.println("Button pressed, entering deep sleep...");
+      display.clearDisplay();
+      display.setCursor(0, 0);
+      display.println("Sleeping...");
+      display.display();
+
       delay(500); // Stabilize
       esp_deep_sleep_start();
+    }
+  }
+}
+
+void handlePrintButton() {
+  if (digitalRead(BUTTON_PRINT) == LOW) {
+    unsigned long currentTime = millis();
+    if (currentTime - lastPressTimePrint > debounceDelay) {
+      lastPressTimePrint = currentTime;
+
+      Serial.println("Button pressed, printing last 10 entries...");
+      printLastEntries();
     }
   }
 }
@@ -144,22 +167,19 @@ void handleDataCollection() {
 
     if (bufferIndex < 10) {
       sensors.requestTemperatures();
-      tempBuffer[bufferIndex] = sensors.getTempCByIndex(0);
-      humBuffer[bufferIndex] = dht.readHumidity();
+      float temp = sensors.getTempCByIndex(0);
+      float hum = dht.readHumidity();
+
+      tempBuffer[bufferIndex] = temp;
+      humBuffer[bufferIndex] = hum;
+
+      String timestamp = String(millis() / 1000) + "s"; // Example timestamp in seconds
 
       digitalWrite(LED_READINGS, HIGH);
       delay(100);
       digitalWrite(LED_READINGS, LOW);
 
-      display.clearDisplay();
-      display.setCursor(0, 0);
-      display.print("Temp: ");
-      display.print(tempBuffer[bufferIndex]);
-      display.println(" C");
-      display.print("Hum: ");
-      display.print(humBuffer[bufferIndex]);
-      display.println(" %");
-      display.display();
+      updateOLED(temp, hum, timestamp);
 
       bufferIndex++;
     } else if (!collectingData) {
@@ -230,15 +250,41 @@ void handleThingSpeak() {
   }
 }
 
-void printFileContents() {
+void printLastEntries() {
   if (SPIFFS.exists("/data.txt")) {
     File file = SPIFFS.open("/data.txt", FILE_READ);
-    Serial.println("Reading data.txt:");
+    Serial.println("Reading last 10 entries:");
+
+    String lines[10];
+    int lineCount = 0;
+
     while (file.available()) {
-      Serial.write(file.read());
+      String line = file.readStringUntil('\n');
+      lines[lineCount % 10] = line;
+      lineCount++;
     }
+
+    int start = max(0, lineCount - 10);
+    for (int i = start; i < lineCount; i++) {
+      Serial.println(lines[i % 10]);
+    }
+
     file.close();
   } else {
     Serial.println("data.txt does not exist.");
   }
+}
+
+void updateOLED(float temp, float hum, const String &timestamp) {
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.print("Temp: ");
+  display.print(temp);
+  display.println(" C");
+  display.print("Hum: ");
+  display.print(hum);
+  display.println(" %");
+  display.print("Time: ");
+  display.println(timestamp);
+  display.display();
 }
